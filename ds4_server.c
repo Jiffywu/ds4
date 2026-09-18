@@ -7187,12 +7187,19 @@ typedef struct {
     openai_tool_stream tool;
 } openai_stream;
 
+static bool stream_needs_second_reasoning_guard(const request *r) {
+    /* The escaped second pass is specific to legacy DeepSeek on Anthropic.
+     * Holding post-think text elsewhere turns a live stream into one final chunk. */
+    return r->api == API_ANTHROPIC &&
+           ds4_think_mode_enabled(r->think_mode) && r->has_tools &&
+           r->model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK;
+}
+
 static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
-    st->guard_second_reasoning =
-        ds4_think_mode_enabled(r->think_mode) && r->has_tools;
+    st->guard_second_reasoning = stream_needs_second_reasoning_guard(r);
 }
 
 static void openai_tool_stream_free(openai_tool_stream *ts) {
@@ -9200,8 +9207,7 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     memset(st, 0, sizeof(*st));
     st->active = ok;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
-    st->guard_second_reasoning =
-        ds4_think_mode_enabled(r->think_mode) && r->has_tools;
+    st->guard_second_reasoning = stream_needs_second_reasoning_guard(r);
     return ok;
 }
 
@@ -16517,6 +16523,46 @@ static void test_anthropic_stream_reroutes_second_reasoning_pass(void) {
     close(sv[1]);
 }
 
+static void test_anthropic_modern_tool_streams_send_answer_before_finish(void) {
+    const server_model_syntax syntaxes[] = {
+        SERVER_MODEL_SYNTAX_DEEPSEEK41,
+        SERVER_MODEL_SYNTAX_GLM,
+        SERVER_MODEL_SYNTAX_QWEN,
+    };
+    for (size_t i = 0; i < sizeof(syntaxes) / sizeof(syntaxes[0]); i++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) continue;
+
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_ANTHROPIC;
+        r.model_syntax = syntaxes[i];
+        r.stream = true;
+        r.think_mode = DS4_THINK_HIGH;
+        r.has_tools = true;
+
+        anthropic_stream st;
+        TEST_ASSERT(anthropic_sse_start_live(sv[0], &r,
+                                             "msg_modern_stream", 5, &st));
+        const char *partial = "first pass</think>first answer chunk";
+        TEST_ASSERT(anthropic_sse_stream_update(
+            sv[0], NULL, &r, "msg_modern_stream", &st,
+            partial, strlen(partial), false));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
+
+        TEST_ASSERT(strstr(out, "\"thinking\":\"first pass\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"text\":\"first answer chunk\"") != NULL);
+
+        free(out);
+        anthropic_stream_free(&st);
+        request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
+}
+
 static void test_anthropic_tool_stream_sends_live_tool_use(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -16710,42 +16756,44 @@ static void test_openai_tool_stream_sends_incremental_text(void) {
     close(sv[1]);
 }
 
-static void test_openai_stream_reroutes_second_reasoning_pass(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
+static void test_openai_tool_streams_send_answer_before_finish(void) {
+    const server_model_syntax syntaxes[] = {
+        SERVER_MODEL_SYNTAX_DEEPSEEK,
+        SERVER_MODEL_SYNTAX_DEEPSEEK41,
+        SERVER_MODEL_SYNTAX_GLM,
+        SERVER_MODEL_SYNTAX_QWEN,
+    };
+    for (size_t i = 0; i < sizeof(syntaxes) / sizeof(syntaxes[0]); i++) {
+        int sv[2];
+        TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+        if (sv[0] < 0 || sv[1] < 0) continue;
 
-    request r;
-    request_init(&r, REQ_CHAT, 128);
-    r.api = API_OPENAI;
-    r.stream = true;
-    r.think_mode = DS4_THINK_HIGH;
-    r.has_tools = true;
+        request r;
+        request_init(&r, REQ_CHAT, 128);
+        r.api = API_OPENAI;
+        r.model_syntax = syntaxes[i];
+        r.stream = true;
+        r.think_mode = DS4_THINK_HIGH;
+        r.has_tools = true;
 
-    openai_stream st;
-    openai_stream_start(&r, &st);
-    const char *partial = "<think>first pass</think>escaped draft";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_second_think",
-                                         &st, partial, strlen(partial), false));
-    const char *complete =
-        "<think>first pass</think>escaped draft</think>final answer";
-    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_second_think",
-                                       &st, complete, strlen(complete), NULL,
-                                       "stop", 5, 9));
-    shutdown(sv[0], SHUT_WR);
-    char *out = read_socket_text(sv[1]);
+        openai_stream st;
+        openai_stream_start(&r, &st);
+        const char *partial = "<think>first pass</think>first answer chunk";
+        TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r,
+                                             "chatcmpl_modern_stream", &st,
+                                             partial, strlen(partial), false));
+        shutdown(sv[0], SHUT_WR);
+        char *out = read_socket_text(sv[1]);
 
-    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"first pass\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"reasoning_content\":\"escaped draft\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"content\":\"final answer\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"content\":\"escaped draft") == NULL);
-    TEST_ASSERT(strstr(out, "</think>") == NULL);
+        TEST_ASSERT(strstr(out, "\"reasoning_content\":\"first pass\"") != NULL);
+        TEST_ASSERT(strstr(out, "\"content\":\"first answer chunk\"") != NULL);
 
-    free(out);
-    openai_stream_free(&st);
-    request_free(&r);
-    close(sv[0]);
-    close(sv[1]);
+        free(out);
+        openai_stream_free(&st);
+        request_free(&r);
+        close(sv[0]);
+        close(sv[1]);
+    }
 }
 
 static void test_openai_stream_usage_reports_cache_details(void) {
@@ -22075,10 +22123,11 @@ static void ds4_server_unit_tests_run(void) {
     test_cors_sse_headers();
     test_anthropic_live_stream_sends_incremental_blocks();
     test_anthropic_stream_reroutes_second_reasoning_pass();
+    test_anthropic_modern_tool_streams_send_answer_before_finish();
     test_anthropic_usage_reports_cache_details();
     test_anthropic_tool_stream_sends_live_tool_use();
     test_openai_tool_stream_sends_incremental_text();
-    test_openai_stream_reroutes_second_reasoning_pass();
+    test_openai_tool_streams_send_answer_before_finish();
     test_openai_stream_usage_reports_cache_details();
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
