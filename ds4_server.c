@@ -7181,25 +7181,15 @@ typedef struct {
     size_t emit_pos;
     bool active;
     bool checked_think_prefix;
-    bool guard_second_reasoning;
     bool sent_reasoning;
     bool sent_content;
     openai_tool_stream tool;
 } openai_stream;
 
-static bool stream_needs_second_reasoning_guard(const request *r) {
-    /* The escaped second pass is specific to legacy DeepSeek on Anthropic.
-     * Holding post-think text elsewhere turns a live stream into one final chunk. */
-    return r->api == API_ANTHROPIC &&
-           ds4_think_mode_enabled(r->think_mode) && r->has_tools &&
-           r->model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK;
-}
-
 static void openai_stream_start(const request *r, openai_stream *st) {
     memset(st, 0, sizeof(*st));
     st->active = true;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? OPENAI_STREAM_THINKING : OPENAI_STREAM_TEXT;
-    st->guard_second_reasoning = stream_needs_second_reasoning_guard(r);
 }
 
 static void openai_tool_stream_free(openai_tool_stream *ts) {
@@ -8080,26 +8070,6 @@ static bool openai_sse_stream_update(int fd, server *s, const request *r, const 
     }
 
     if (st->mode == OPENAI_STREAM_TEXT) {
-        if (st->guard_second_reasoning) {
-            const char *close = strstr(raw + st->emit_pos, "</think>");
-            const char *tool = r->has_tools ?
-                find_any_tool_start(raw + st->emit_pos) : NULL;
-            if (close && (!tool || close < tool)) {
-                const size_t limit = (size_t)(close - raw);
-                if (limit > st->emit_pos &&
-                    !sse_chat_delta_n(fd, r, id, "reasoning_content",
-                                      raw + st->emit_pos,
-                                      limit - st->emit_pos)) return false;
-                if (limit > st->emit_pos) st->sent_reasoning = true;
-                st->emit_pos = limit + strlen("</think>");
-                st->guard_second_reasoning = false;
-            } else if (!tool && !final) {
-                return true;
-            } else {
-                st->guard_second_reasoning = false;
-            }
-        }
-
         const char *tool = r->has_tools ? find_any_tool_start(raw + st->emit_pos) : NULL;
         size_t limit = text_stream_safe_limit(raw, st->emit_pos, raw_len,
                                               r->has_tools, final);
@@ -9207,7 +9177,11 @@ static bool anthropic_sse_start_live(int fd, const request *r, const char *id,
     memset(st, 0, sizeof(*st));
     st->active = ok;
     st->mode = ds4_think_mode_enabled(r->think_mode) ? ANTH_STREAM_THINKING : ANTH_STREAM_TEXT;
-    st->guard_second_reasoning = stream_needs_second_reasoning_guard(r);
+    /* Retain the #678 workaround for the original DeepSeek tool format.
+     * It buffers answer text until a tool call, second close tag, or finish. */
+    st->guard_second_reasoning =
+        ds4_think_mode_enabled(r->think_mode) && r->has_tools &&
+        r->model_syntax == SERVER_MODEL_SYNTAX_DEEPSEEK;
     return ok;
 }
 
@@ -16530,9 +16504,11 @@ static void test_anthropic_modern_tool_streams_send_answer_before_finish(void) {
         SERVER_MODEL_SYNTAX_QWEN,
     };
     for (size_t i = 0; i < sizeof(syntaxes) / sizeof(syntaxes[0]); i++) {
-        int sv[2];
+        int sv[2] = {-1, -1};
         TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
         if (sv[0] < 0 || sv[1] < 0) continue;
+
+        TEST_ASSERT(fcntl(sv[1], F_SETFL, O_NONBLOCK) == 0);
 
         request r;
         request_init(&r, REQ_CHAT, 128);
@@ -16549,12 +16525,31 @@ static void test_anthropic_modern_tool_streams_send_answer_before_finish(void) {
         TEST_ASSERT(anthropic_sse_stream_update(
             sv[0], NULL, &r, "msg_modern_stream", &st,
             partial, strlen(partial), false));
-        shutdown(sv[0], SHUT_WR);
         char *out = read_socket_text(sv[1]);
 
         TEST_ASSERT(strstr(out, "\"thinking\":\"first pass\"") != NULL);
         TEST_ASSERT(strstr(out, "\"text\":\"first answer chunk\"") != NULL);
+        TEST_ASSERT(strstr(out, "</think>") == NULL);
+        free(out);
 
+        const char *complete = "first pass</think>first answer chunk and more ";
+        TEST_ASSERT(anthropic_sse_stream_update(
+            sv[0], NULL, &r, "msg_modern_stream", &st,
+            complete, strlen(complete), false));
+        out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "\"text\":\" and more\"") != NULL);
+        TEST_ASSERT(strstr(out, "first answer chunk") == NULL);
+        TEST_ASSERT(strstr(out, "first pass") == NULL);
+        free(out);
+
+        TEST_ASSERT(anthropic_sse_finish_live(
+            sv[0], NULL, &r, "msg_modern_stream", &st,
+            complete, strlen(complete), NULL, "stop", 9));
+        out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "\"text\":\" \"") != NULL);
+        TEST_ASSERT(strstr(out, "event: message_stop") != NULL);
+        TEST_ASSERT(strstr(out, "first answer chunk") == NULL);
+        TEST_ASSERT(strstr(out, "and more") == NULL);
         free(out);
         anthropic_stream_free(&st);
         request_free(&r);
@@ -16764,9 +16759,11 @@ static void test_openai_tool_streams_send_answer_before_finish(void) {
         SERVER_MODEL_SYNTAX_QWEN,
     };
     for (size_t i = 0; i < sizeof(syntaxes) / sizeof(syntaxes[0]); i++) {
-        int sv[2];
+        int sv[2] = {-1, -1};
         TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
         if (sv[0] < 0 || sv[1] < 0) continue;
+
+        TEST_ASSERT(fcntl(sv[1], F_SETFL, O_NONBLOCK) == 0);
 
         request r;
         request_init(&r, REQ_CHAT, 128);
@@ -16782,12 +16779,31 @@ static void test_openai_tool_streams_send_answer_before_finish(void) {
         TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r,
                                              "chatcmpl_modern_stream", &st,
                                              partial, strlen(partial), false));
-        shutdown(sv[0], SHUT_WR);
         char *out = read_socket_text(sv[1]);
 
         TEST_ASSERT(strstr(out, "\"reasoning_content\":\"first pass\"") != NULL);
         TEST_ASSERT(strstr(out, "\"content\":\"first answer chunk\"") != NULL);
+        TEST_ASSERT(strstr(out, "</think>") == NULL);
+        free(out);
 
+        const char *complete = "<think>first pass</think>first answer chunk and more ";
+        TEST_ASSERT(openai_sse_stream_update(
+            sv[0], NULL, &r, "chatcmpl_modern_stream", &st,
+            complete, strlen(complete), false));
+        out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "\"content\":\" and more\"") != NULL);
+        TEST_ASSERT(strstr(out, "first answer chunk") == NULL);
+        TEST_ASSERT(strstr(out, "first pass") == NULL);
+        free(out);
+
+        TEST_ASSERT(openai_sse_finish_live(
+            sv[0], NULL, &r, "chatcmpl_modern_stream", &st,
+            complete, strlen(complete), NULL, "stop", 5, 9));
+        out = read_socket_text(sv[1]);
+        TEST_ASSERT(strstr(out, "\"content\":\" \"") != NULL);
+        TEST_ASSERT(strstr(out, "data: [DONE]") != NULL);
+        TEST_ASSERT(strstr(out, "first answer chunk") == NULL);
+        TEST_ASSERT(strstr(out, "and more") == NULL);
         free(out);
         openai_stream_free(&st);
         request_free(&r);
